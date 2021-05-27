@@ -1,0 +1,1638 @@
+#!/usr/bin/perl -w 
+
+
+# OUTSTANDING TASKS
+# -----------------
+#   add support for HP EVA disk
+#   Bug alert: lsdev -p vscsi#  does not show all the disks as children of all vscsi adapters
+
+
+#
+#  Nagios plugin for determining disk path (ie multi-pathing) availability.
+#  This script will check for disk paths on system using MPIO or SDD drivers
+#
+
+# CHANGE LOG
+# ----------
+#   2008-08-22	njeffrey@anisoftgroup.com	Script created
+#   2008-08-23	njeffrey@anisoftgroup.com	Add support for IBM AIX SDD driver (obsolete as of 2010)
+#   2008-08-24	njeffrey			Add support for IBM AIX MPIO driver 
+#   2010-08-18	njeffrey			See if blade server managed by IVM - will only have one vscsi0 path to IVM
+#   2010-12-16	njeffrey			Enhance section that checks for rootvg disk - there was a bug that missed hdisk0 disk if booting from SAN
+#   2010-12-16	njeffrey			Add check_fc_adapter_settings subroutine to check settings of fibre channel adapters
+#   2010-12-16	njeffrey			Add check_emc_disk_settings subroutine to check attributes of EMC Symmetrix disk
+#   2010-12-16	njeffrey			Add check_vscsi_disk_settings subroutine to check attributes of VIOS-provided disk
+#   2010-12-16	njeffrey			Add check_ibm_sddpcm_disk_settings subroutine to check attributes of SVC/DS8000 disk
+#   2010-12-16	njeffrey			Add check_netapp_disk_settings subroutine to check attributes of NetApp disk
+#   2010-12-18	njeffrey			Add check_rootvg_disks subroutine to check for LV-backed disk from VIO that is mirrored at the LVM layer
+#   2010-12-19	njeffrey			Add bug fixes and more error checking
+#   2010-12-21	njeffrey			Add enhanced error checks for SDD drivers
+#   2010-12-22	njeffrey			Add support for sas devices (newer hardware has /dev/sas0 instead of /dev/scsi0
+#   2011-01-07	njeffrey			Add support for LPARs running under IVM on a blade that also have their own assigned FC adapter (ie TSM server on a blade LPAR)
+#   2011-03-05	njeffrey			Bug fix - redirect prtconf stderr to stdout to avoid error checking physical volumes in volume groups that are varied off
+#   2012-07-12	njeffrey			Add check_vscsi_adapters subroutine to look for vscsi_err_recov and vscsi_fast_fail attributes
+#   2015-06-05	njeffrey			POWER 710 servers only support single VIOS - skip checks for dual VIOS on this hardware model
+#   2017-11-03	njeffrey			Bug fix - typo in redirecting STDERR to STDOUT  2>1 instead of 2>&1 
+#   2017-11-03	njeffrey			Bug fix - error in regex for adding disks to @disks_to_skip array
+#   2017-11-03	njeffrey			Add support for EMC Clariion / EMC VNX storage using EMC ODM add-on for AIX MPIO
+#
+#
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  NOTE: The SDD drivers were obsolete in 2010, so you will probably not need to worry about this section.
+#  Assuming the SDD drivers are installed, this script will attempt to execute 
+#  the /usr/sbin/datapath command.  By default, the datapath file is only executable.
+#  by the root user. However, this script is run in the security context of the nagios
+#  userid, so we depend on sudo to allow access to the /usr/sbin/datapath binary.
+#  You will need something similar to the following in the /etc/sudoers file:
+#     User_Alias      NAGIOS_USER = nagios
+#     Cmnd_Alias      DATAPATH_QA = /usr/sbin/datapath query adapter
+#     Cmnd_Alias      DATAPATH_QD = /usr/sbin/datapath query device
+#     NAGIOS_USER ALL = (root) NOPASSWD: DATAPATH_QA
+#     NAGIOS_USER ALL = (root) NOPASSWD: DATAPATH_QD
+#
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.  You will need to add a section similar to the following
+#  to the services.cfg file on the nagios server.  Please note that this example assumes
+#  you are using the check_by_ssh method for remotely executing nagios checks.  This assumes
+#  that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-24x7-service
+#              hostgroup_name                  all_aix
+#              service_description             Check AIX disk paths
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_aix_disk_paths
+#              }
+#
+#  This script will validate the following features for disks using MPIO as the multipathing driver:
+#     - each hdisk has paths to at least 2 vscsi or fscsi adapters
+#     - each hdisk has at least 2 paths
+#     - no paths are in one of the following states: Disabled, Failed, Unknown, Defined
+#     - all paths are in the "Enabled" state (which is kinda assumed by the previous line)
+
+
+# TROUBLESHOOTING
+# ---------------
+#
+# If you get a "Remote command execution failed" error from nagios, it probably means
+# you forgot to configure sudo to allow the nagios user to execute the datapath command.
+# This is unlikely to occur, as the SDD driver was replaced by SDDPCM in 2010.
+#
+
+use diagnostics;				#tell the perl interpreter to give us verbose messages while debugging
+use strict;					#enforce good coding practices
+
+
+
+
+
+# define variables
+my $lspath              = "";  			#location of lspath binary
+my $prtconf             = "";  			#location of prtconf binary
+my $lsrsrc              = "";  			#location of lsrsrc binary
+my $datapath            = "";  			#location of datapath binary
+my $lspv                = "";  			#location of lspv binary
+my $lsvg                = "";  			#location of lsvg binary
+my $lsattr              = "";  			#location of lsattr binary
+my $lsdev               = "";  			#location of lsdev binary
+my $uniq                = "";  			#location of uniq binary
+my $lslpp               = "";  			#location of lslpp binary
+my $oslevel             = "";  			#location of oslevel binary
+my $sdd_installed       = "";			#yes/no flag to see if SDD drivers are installed
+my $sdd_adapter_status  = "";			#filehandle opened using command output
+my $sdd_adapter_num     = ""; 			#numeric identifier of scsi adapter used by SDD driver
+my $sdd_adapter_name    = ""; 			#name of scsi adapter used by SDD driver
+my $sdd_adapter_state   = ""; 			#name of scsi adapter used by SDD driver
+my $sdd_adapter_mode    = ""; 			#mode of scsi adapter used by SDD driver
+my $sdd_adapter_select  = ""; 			#number of selections of scsi adapter used by SDD driver
+my $sdd_adapter_errors  = ""; 			#errors on scsi adapter used by SDD driver
+my $sdd_adapter_paths   = ""; 			#number of available paths on scsi adapter used by SDD driver
+my $sdd_adapter_active  = ""; 			#number of active paths on adapter used by SDD driver
+my $vpath_count         = "";			#number of vpath devices
+my $vpath_open          = "";			#how many vpath devices are in OPEN state
+my $vpath_close         = "";			#how many vpath devices are in CLOSE state
+my $vpath_closed_dead   = "";			#how many vpath devices are in CLOSE_DEAD state
+my $vpath_dead          = "";			#how many vpath devices are in DEAD state
+my $vpath_invalid       = "";			#how many vpath devices are in INVALID state
+my $mpio_adapter_count  = "";			#figure out how many adapters we are spreading paths across
+my $mpio_path_count     = "";			#figure out how many paths exist for each hdisk
+my $mpio_state_enabled  = "";			#number of MPIO disks with enabled  paths
+my $mpio_state_missing  = "";			#number of MPIO disks with missing  paths	
+my $mpio_state_failed   = "";			#number of MPIO disks with failed   paths
+my $mpio_state_disabled = "";			#number of MPIO disks with disabled paths
+my $mpio_state_defined  = "";			#number of MPIO disks with defined  paths
+my $mpio_state_unknown  = "";			#number of MPIO disks with unknown  paths
+my $mpio_state          = "";     		#state of MPIO path
+my $mpio_disk           = "";    		#name of MPIO disk
+my $mpio_parent         = "";  			#parent device of disk - usually a scsi adapter of some sort
+my $sudo                = "";			#placeholder variable for location of sudo binary
+my $rootvg_check        = "";			#flag to determine if a disk is a member of the rootvg volume group
+my $rootvg_num_disks    = "";			#number of disks in rootvg
+my @rootvg_disks        = "";			#array to hold names of disks in rootvg
+my $varyon_check        = "";			#flag to determine if a disk is a member of a volume group that is varied on
+my @scsi                = "";			#array to hold list of all local scsi adapters (scsi0,scsi1,etc)
+my $scsi                = "";			#variable to hold current value of @scsi array
+my @sas                 = "";			#array to hold list of all local sas adapters (sas0,sas1,etc)
+my $sas                 = "";			#variable to hold current value of @sas array
+my @fscsi               = "";			#array to hold list of all local fibre channel adapters (fscsi0,fscsi1,etc)
+my $fscsi                = "";			#variable to hold current value of @fscsi array
+my @vscsi               = "";			#array to hold list of all client Virtual SCSI adapters (vscsi0,vscsi1,etc)
+my $vscsi               = "";			#variable to hold current value of @vscsi array
+my $lpar_type           = "";			#variable to hold type of LPAR (managed by HMC, IVM, standalone, etc)
+my $scsi_count          = "";			#variable to hold number of scsi adapters
+my $sas_count           = "";			#variable to hold number of sas adapters
+my $fscsi_count         = "";			#variable to hold number of fscsi adapters
+my $vscsi_count         = "";			#variable to hold number of vscsi adapters
+my $blade               = "";			#flag to determine if this is blade hardware or not 
+my %fc_adapters         = ();			#initialize hash to hold details of fibre channel adapter settings
+my %vscsi_adapters      = ();			#initialize hash to hold details of vscsi adapter settings
+my %hdisk_info          = ();			#initialize hash to hold details of hdisk settings settings
+my $verbose             = "no";			#display verbose output - for debugging  (value: yes/no)
+my $key                 = "";			#variable to hold current value of hash key
+my $lv_name             = "";			#logical volume name from rootvg
+my $lv_type             = "";			#type of logical volume (jfs jfs2 boot sysdump paging)
+my $lv_lps              = "";			#number of logical partitions in logical volume
+my $lv_pps              = "";			#number of physical partitions in logical volume
+my $lv_pvs              = "";			#number of physical volumes in logical volume
+my ($CHECK_NAME,$OK,$WARN,$CRITICAL,$UNKNOWN,$hdisk,@hdisks,@hdisks_to_skip,%hdisks_to_skip,%hdisks);
+
+
+
+
+$CHECK_NAME= "AIX_DISK_PATHS";                   #define name of nagios check
+
+#
+# Nagios return codes
+#
+$OK=            0;                              #this script returns a value to nagios for processing
+$WARN=          1;                              #this script returns a value to nagios for processing
+$CRITICAL=      2;                              #this script returns a value to nagios for processing
+$UNKNOWN=       3;                              #this script returns a value to nagios for processing
+
+
+
+
+
+
+sub sanity_checks {
+   #
+   # confirm the lspv binary exists and is executable
+   #
+   $lspv = "/usr/sbin/lspv";
+   if ( ! -e $lspv ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lspv binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $lspv ) {
+      print "$CHECK_NAME CRITICAL - $lspv binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   $lsvg = "/usr/sbin/lsvg";
+   if ( ! -e $lsvg ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lsvg binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $lsvg ) {
+      print "$CHECK_NAME CRITICAL - $lsvg binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   $lsattr = "/usr/sbin/lsattr";
+   if ( ! -e $lsattr ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lsattr binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $lsattr ) {
+      print "$CHECK_NAME CRITICAL - $lsattr binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   $lsdev = "/usr/sbin/lsdev";
+   if ( ! -e $lsdev ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lsdev binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $lsdev ) {
+      print "$CHECK_NAME CRITICAL - $lsdev binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   # confirm the uniq binary exists and is executable
+   #
+   $uniq = "/usr/bin/uniq";
+   if ( ! -e $uniq ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $uniq binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $uniq ) {
+      print "$CHECK_NAME CRITICAL - $uniq binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   $lslpp = "/usr/bin/lslpp";
+   if ( ! -e $lslpp ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lslpp binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $lslpp ) {
+      print "$CHECK_NAME CRITICAL - $lslpp binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   $oslevel = "/usr/bin/oslevel";
+   if ( ! -e $oslevel ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $oslevel binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $oslevel ) {
+      print "$CHECK_NAME CRITICAL - $oslevel binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   #
+   # Exit script if no multipath drivers are installed
+   #
+   $lspath   = "/usr/sbin/lspath";
+   $datapath = "/usr/sbin/datapath";
+   if ( ! -e $lspath ) {
+      if ( ! -e $datapath ) {
+         print "$CHECK_NAME OK - nothing to do.  Could not find $lspath or $datapath.  No multipath drivers installed on this machine.\n";
+         exit( $OK );
+      }
+   }
+   #
+   # confirm the lsrsrc binary exists and is executable
+   #
+   $lsrsrc = "/usr/bin/lsrsrc";
+   if ( ! -e $lsrsrc ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lsrsrc binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $lsrsrc ) {
+      print "$CHECK_NAME CRITICAL - $lsrsrc binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   # confirm the prtconf binary exists and is executable
+   #
+   $prtconf = "/usr/sbin/prtconf";
+   if ( ! -e $prtconf ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $prtconf binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $prtconf ) {
+      print "$CHECK_NAME CRITICAL - $prtconf binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+}					#end of subroutine
+
+
+
+sub check_fc_adapter_settings {
+   #
+   # this section validates the configuration settings on the fibre channel adapters
+   # We want the attributes of each fibre channel adapter to look similar to this:
+   #  $lsattr -El fscsi0
+   #  attach       switch    How this adapter is CONNECTED         False
+   #  dyntrk       yes       Dynamic Tracking of FC Devices        True
+   #  fc_err_recov fast_fail FC Fabric Event Error RECOVERY Policy True
+   #  scsi_id      0x10800   Adapter SCSI ID                       False
+   #  sw_fc_class  3         FC Class for Fabric                   True
+   #
+   # The important attributes from above are dyntrk=yes and fc_err_recov=fast_fail
+   # These attributes allow rapid failover in the event of a fibre path going down.
+   # Here is the official IBM documentation on the matter:
+   #
+   #
+   # AIX supports Fast I/O Failure for Fibre Channel (FC) devices after link events in a switched environment.
+   #
+   # If the FC adapter driver detects a link event, such as a lost link between a storage device and a switch, 
+   # the FC adapter driver waits a short period of time, approximately 15 seconds, so that the fabric can stabilize. 
+   # At that point, if the FC adapter driver detects that the device is not on the fabric, it begins failing all I/Os 
+   # at the adapter driver. Any new I/O or future retries of the failed I/Os are failed immediately by the adapter 
+   # until the adapter driver detects that the device has rejoined the fabric.
+   # Fast Failure of I/O is controlled by a new fscsi device attribute, fc_err_recov. The default setting for this 
+   # attribute is delayed_fail, which is the I/O failure behavior seen in previous versions of AIX. To enable Fast I/O Failure, 
+   # set this attribute to fast_fail, as shown in the example:
+   # 
+   # chdev -l fscsi0 -a fc_err_recov=fast_fail  
+   #
+   # In this example, the fscsi device instance is fscsi0. Fast fail logic is called when the adapter driver receives an 
+   # indication from the switch that there has been a link event involving a remote storage device port by way of a 
+   # Registered State Change Notification (RSCN) from the switch.
+   #
+   # Fast I/O Failure is useful in situations where multipathing software is used. Setting the fc_err_recov attribute to fast_fail 
+   # can decrease the I/O fail times because of link loss between the storage device and switch. This would support faster failover to alternate paths.
+   #
+   # In single-path configurations, especially configurations with a single path to a paging device, the delayed_fail default setting is recommended.
+   # Fast I/O Failure requires the following:
+   #
+   #    * A switched environment. It is not supported in arbitrated loop environments, including public loop.
+   #    * FC 6227 adapter firmware, level 3.22A1 or higher.
+   #    * FC 6228 adapter firmware, level 3.82A1 or higher.
+   #    * FC 6239 adapter firmware, all levels.
+   #    * All subsequent FC adapter releases support Fast I/O Failure.
+   #
+   # If any of these requirements is not met, the fscsi device logs an error log of type INFO indicating that one of these requirements is not met and 
+   # that Fast I/O Failure is not enabled.
+   #
+   #
+   print "running check_fc_adapter_settings subroutine \n" if ($verbose eq "yes");
+   open(IN,"$lsdev|");   					#open filehandle using command output
+   while (<IN>) {                                		#read a line from filehandle
+      if ( /^(fscsi[0-9]+)/ ) {					#look for fscsi devices (fibre channel adapters)
+         push (@fscsi,$1);					#add fscsi device to array
+      } 							#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   foreach $fscsi (@fscsi) {
+      next if ( $fscsi eq "" );             			#skip any blank array elements
+      open (IN,"$lsattr -El $fscsi |");   			#open filehandle using command output
+      while (<IN>) {                                            #read a line from filehandle
+         $fc_adapters{$fscsi}{dyntrk}       = $1 if ( /^dyntrk +([a-zA-Z0-9]+)/ ); 		#look for the dynamic tracking attribute and put into hash
+         $fc_adapters{$fscsi}{fc_err_recov} = $1 if ( /^fc_err_recov +([a-zA-Z0-9_]+)/ ); 	#look for the fc_err_recov attribute and put into hash
+      }                                                         #end of while loop
+      close IN;                                                 #close filehandle
+      print "   $fscsi dyntrk=$fc_adapters{$fscsi}{dyntrk} fc_err_recov=$fc_adapters{$fscsi}{fc_err_recov} \n" if ($verbose eq "yes");
+   }								#end of foreach loop
+   #
+   # loop through hash looking for problems with FC adapters
+   foreach $key (keys %fc_adapters) {   			#loop through for each fscsi device
+      next unless $key;      					#skip any blank lines
+      #
+      # this section gets run if both the dyntrk and fc_err_recov attributes are wrong
+      #
+      if ( ($fc_adapters{$key}{dyntrk} ne "yes") &&  ($fc_adapters{$key}{fc_err_recov} ne "fast_fail") )  {
+         print "$CHECK_NAME WARN - the $key fibre channel adapter is not configured to allow fast disk path failover.  You should also check your other FC adapters with lsattr -El fscsi#.  Run the following command to fix up the fscsi adapters and then reboot:  chdev -l $key -a dyntrk=yes -a fc_err_recov=fast_fail -P  \n";
+         exit $WARN;
+      }								#end of if block
+      #
+      # this section gets run if only the dyntrk attribute is wrong
+      #
+      if ( $fc_adapters{$key}{dyntrk} ne "yes" ) {
+         print "$CHECK_NAME WARN - the $key fibre channel adapter does not have dynamic tracking enabled.  This slows down path failover.  You should also check your other FC adapters with lsattr -El fcsi#.  Please run the following command and reboot: chdev -l $key -a dyntrk=yes -P  \n";
+         exit $WARN;
+      }								#end of if block
+      #
+      # this section gets run if only the fc_err_recov attribute is wrong
+      #
+      unless ( $fc_adapters{$key}{fc_err_recov} eq "fast_fail" ) {
+         print "$CHECK_NAME WARN - the $key fibre channel adapter does not have fast error recovery enabled.  This slows down path failover.  You should also check your other FC adapters with lsattr -El fcsi#.  Please run the following command and reboot: chdev -l $key -a fc_err_recov=fast_fail -P  \n";
+         exit $WARN;
+      }								#end of if block
+   }                                                            #end of foreach loop
+}								#end of subroutine
+
+
+
+
+
+sub check_blade_hardware {
+   #
+   # If the local machine is an AIX LPAR that is on a blade server managed by IVM,
+   # it will only have a single path to the vscsi adapter on the VIO partition.
+   #
+   # That means we should NOT check to see if it has multiple paths to its disk, as there will only be one path.
+   #
+   # Here is the output of a command on a system that is not managed by an HMC:
+   #   # /usr/bin/lsrsrc IBM.ManagementServer
+   # Resource Persistent Attributes for IBM.ManagementServer
+   #
+   # Here is the same command on an AIX 5.3 or 6.1 system that is managed by an HMC:
+   #   # /usr/bin/lsrsrc IBM.ManagementServer
+   # Resource Persistent Attributes for IBM.ManagementServer
+   # resource 1:
+   #        Name             = "64.126.53.95"
+   #        Hostname         = "64.126.53.95"
+   #        ManagerType      = "HMC"
+   #        LocalHostname    = "aixsrv01.example.com"
+   #        ClusterTM        = "9078-160"
+   #        ClusterSNum      = ""
+   #        ActivePeerDomain = ""
+   #        NodeNameList     = {"aixsrv01"}
+   #
+   #
+   # Here is a slightly different command on an AIX 7.1 system that is managed by an HMC:
+   #   # lsrsrc IBM.MCP
+   # Resource Persistent Attributes for IBM.MCP
+   # resource 1:
+   #     MNName            = "10.0.0.37"
+   #     NodeID            = 67879703212742343
+   #     KeyToken          = "hmc01.example.com"
+   #     IPAddresses       = {"10.0.0.36"}
+   #     ConnectivityNames = {"10.0.0.37"}
+   #     HMCName           = "7310CR2*1053A2A"
+   #     HMCIPAddr         = "10.0.0.36"
+   #     HMCAddIPs         = "192.168.128.1"
+   #     HMCAddIPv6s       = "fe80:0:0:0:20d:60ff:fed5:4459,fe80:0:0:0:20d:60ff:fed5:4458"
+   #     ActivePeerDomain  = ""
+   #     NodeNameList      = {"aixsrv02"}
+   #
+   #
+   print "running check_blade_hardware subroutine \n" if ($verbose eq "yes");
+   return unless ( -e "$lsrsrc" );				#break out of subroutine if $lsrsrc binary does not exist
+   return if     ( -e "/usr/ios/cli/ioscli" );			#break out of subroutine if this is a VIO server
+   #
+   # 
+   $lpar_type = "full_system_partition";			#assume full system partition unless shown otherwise
+   open(OSLEVEL,"$oslevel |");					#figure out what version of AIX we are using
+   while (<OSLEVEL>) {                                		#read a line from filehandle 
+      chomp; 							#remove newline
+      print "   oslevel is $_ \n" if ($verbose eq "yes");
+      #
+      if ( (/^5.3/) || (/^6.1/) ) {				#for AIX 5.3 or 6.1
+         open(IN,"$lsrsrc IBM.ManagementServer 2>&1|");		#open filehandle using command output
+         while (<IN>) {                                		#read a line from filehandle 
+            if ( /ManagerType += \"HMC\"/ ) { 			#look for the line that tells us this is an HMC or IVM managed LPAR
+               $lpar_type="lpar_under_hmc"; 			#set variable that we will refer to later
+            }							#end of if block
+         }							#end of while block
+         close IN;						#close filehandle
+        
+      } 
+      elsif ( /^7.1/ ) {					#for AIX 7.1
+         open(IN,"$lsrsrc IBM.MCP 2>&1 |"); 			#open filehandle using command output 
+         while (<IN>) {                                		#read a line from filehandle 
+            if ( /KeyToken +=/ ) {				#look for the line that tells us this is an HMC or IVM managed LPAR
+               $lpar_type="lpar_under_hmc"; 			#set variable that we will refer to later
+            }							#end of if block
+         }							#end of while block
+         close IN;						#close filehandle
+      }								#end of elsif block
+      else {							#we only get here if the AIX version is unrecognized
+      print "$CHECK_NAME WARN - could not determine the version of AIX\n"; 
+      exit( $WARN );						#exit script
+      
+      }								#end of else
+   }								#end of while block
+   close OSLEVEL;						#close filehandle
+   #
+   # Check to see if the hardware matches the known blade model types
+   # This is not a great way to check for blade hardware, because it needs to be 
+   # updated as new models are released.  However, we can't tell from the LPAR
+   # if it is managed by an IVM or HMC.
+   #
+   print "   Using prtconf to check model number to see if this is a blade \n" if ($verbose eq "yes");
+   $blade = "";							#initialize variable
+   #NOTE: prtconf will generate an error querying physical volumes if the volume group is varied off (ie in an HACMP environment)
+   #      redirect stderr to stdout so the nagios check does not complain.
+   open(IN,"$prtconf 2>&1|");  					#open filehandle using command output 
+   while (<IN>) {                                		#read a line from filehandle
+      $blade = "yes" if ( /^System Model: IBM,7988/ );		#model number for JS12
+      $blade = "yes" if ( /^System Model: IBM,8842/ );		#model number for JS20
+      $blade = "yes" if ( /^System Model: IBM,8844/ );		#model number for JS21
+      $blade = "yes" if ( /^System Model: IBM,7998/ );		#model number for JS22
+      $blade = "yes" if ( /^System Model: IBM,7778/ );		#model number for JS23/JS43
+      $blade = "yes" if ( /^System Model: IBM,8406/ );		#model number for PS700/PS701/PS702
+      $blade = "yes" if ( /^System Model: IBM,8231/ );		#model number for POWER710.  Not really a blade, but only supports single VIOS
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   #
+   # We get this far if we are not entirely certain if the LPAR is running under IVM or HMC
+   # Let's count the adapters to see if they are all virtual
+   #
+   #
+   $sas_count = 0;						#initialize variable
+   $scsi_count = 0;						#initialize variable
+   $fscsi_count = 0;						#initialize variable
+   $vscsi_count = 0;						#initialize variable
+   #
+   open(IN,"$lsdev|");   					#open filehandle using command output
+   while (<IN>) {                                		#read a line from filehandle
+      $sas_count++   if ( /^sas[0-9]+/ );			#increment counter for each scsi device found
+      $scsi_count++  if ( /^scsi[0-9]+/ );			#increment counter for each scsi device found
+      $fscsi_count++ if ( /^fscsi[0-9]+/ );			#increment counter for each fscsi device found
+      $vscsi_count++ if ( /^vscsi[0-9]+/ );			#increment counter for each vscsi device found
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   if ( $lpar_type eq "lpar_under_hmc" && $blade eq "yes" && $fscsi_count == 0 ) {
+      print "$CHECK_NAME OK - this LPAR is running on blade hardware under an IVM, so it will only have a single disk path to the VIO server.  This check is meaningless in a blade environment.\n"; 
+      exit( $OK );						# give nagios an OK status because running this doesn't hurt
+   }								#end of if block
+   if ( $lpar_type eq "lpar_under_hmc" && $sas_count == 0 && $scsi_count == 0 && $fscsi_count == 0 && $vscsi_count == 1 ) {
+      print "$CHECK_NAME WARN - there are no physical disk adapters, and only $vscsi_count virtual adapters. If this is a blade managed by IVM, you will only have a single disk path to the VIO server, so you should not be running this check, as it is meaningless in an IVM environment.  If this system is not on blade hardware, you should add another vscsi adapter to another VIO server, which might require you to setup a dual VIO environment.\n"; 
+      exit( $WARN );
+   }								#end of if block
+}								#end of subroutine
+
+
+
+
+sub get_hdisk_info {
+   # 
+   # this section pulls assorted config settings for all the hdisks and vpaths
+   # for use later in the script
+   #
+   print "running get_hdisk_info subroutine \n" if ($verbose eq "yes");
+   open(IN,"$lspv|");         					#open filehandle using command output
+   while (<IN>) {                                		#read a line from filehandle
+      $hdisk_info{$1}{name}=$1 if (/^(hdisk[0-9]+)/);		#put hdisk into hash
+      $hdisk_info{$1}{name}=$1 if (/^(vpath[0-9]+)/);		#put vpath into hash (for systems using SDD driver)
+   }                                                            #end of while loop
+   close IN; 							#close filehandle
+   # 
+   # Now that we have all the hdisk names, let's get some detail on each of them
+   #
+   print "   getting disk attributes \n" if ($verbose eq "yes");
+   foreach $key (keys %hdisk_info) {        			#loop through for each hdisk device
+      next unless $key;                                         #skip any blank lines
+      #
+      # generate dummy values for disk characteristics so we don't get errors when checking for them later
+      #
+      $hdisk_info{$key}{pcm}="unknown"             unless $hdisk_info{$key}{pcm}; 		#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{algorithm}="unknown"       unless $hdisk_info{$key}{algorithm}; 	#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{hcheck_interval}=0         unless $hdisk_info{$key}{hcheck_interval}; 	#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{hcheck_mode}="unknown"     unless $hdisk_info{$key}{hcheck_mode}; 	#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{reserve_policy}="unknown"  unless $hdisk_info{$key}{reserve_policy}; 	#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{queue_depth}=0             unless $hdisk_info{$key}{queue_depth}; 	#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{fromvio}="no"              unless $hdisk_info{$key}{fromvio}; 		#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{pvid}="unknown"            unless $hdisk_info{$key}{pvid}; 		#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{vgname}="unknown"          unless $hdisk_info{$key}{vgname}; 		#put in a dummy value so we don't get errors checking for this later
+      $hdisk_info{$key}{vgactive}="unknown"        unless $hdisk_info{$key}{vgactive}; 		#put in a dummy value so we don't get errors checking for this later
+      #
+      # Now actually query the disks and put in the real values where applicable
+      #
+      open(IN,"$lsattr -El $key |");  				#open filehandle using command output
+      while (<IN>) {                                		#read a line from filehandle
+         $hdisk_info{$key}{pcm}=$1             if (/^PCM +([a-zA-Z0-9\/]+)/);		#get the path control module
+         $hdisk_info{$key}{algorithm}=$1       if (/^algorithm +([a-zA-Z0-9_]+)/);	#get the algorithm - will be fail_over or single_path
+         $hdisk_info{$key}{hcheck_interval}=$1 if (/^hcheck_interval +([0-9]+)/);	#get the health check interval - should be nonzero
+         $hdisk_info{$key}{hcheck_mode}=$1     if (/^hcheck_mode +([a-zA-Z0-9_]+)/);	#get the health check interval - should be nonzero
+         $hdisk_info{$key}{reserve_policy}=$1  if (/^reserve_policy +([a-zA-Z0-9_]+)/);	#get the reserve policy - should be no_reserve
+         $hdisk_info{$key}{queue_depth}=$1     if (/^queue_depth +([0-9]+)/);		#get the queue depth - differs by disk subsystem
+      }     							#end of while loop
+      close IN; 						#close filehandle
+      print "      $key pcm=$hdisk_info{$key}{pcm} algorithm=$hdisk_info{$key}{algorithm} hcheck_interval=$hdisk_info{$key}{hcheck_interval} hcheck_mode=$hdisk_info{$key}{hcheck_mode} reserve_policy=$hdisk_info{$key}{reserve_policy} \n" if ($verbose eq "yes");
+   }								#end of foreach loop
+   #
+   # Now let's see which volume group each disk is in.
+   # The command output will look similar to:
+   # $ lspv
+   # hdisk0          00f7ddd3433f6ee9                    rootvg          active
+   # hdisk1          00f7ddd382db149e                                    None
+   # hdisk4          00f7ddd3433f6793                    vgoraarch       active
+   # hdisk5          00f7ddd3433f69e0                    vgoraback       active
+   # hdisk6          00f7ddd3433f6bd0                    vgoradata       active
+   # hdisk8          00f7ddd3433f6d79                    vgs00ora        active
+   #
+   #
+   print "   getting hdisk to volume group mappings \n" if ($verbose eq "yes");
+   open(IN,"$lspv |");         					#open filehandle using command output
+   while (<IN>) {                                		#read a line from filehandle
+      #
+      # look for disks in volume groups that are varied on
+      #
+      if (/^(hdisk[0-9]+) +([a-z0-9]{16}) +([a-zA-Z0-9_]+) +active/){	#look for disks with a PVID in an "active" state
+         $hdisk_info{$1}{pvid}=$2;
+         $hdisk_info{$1}{vgname}=$3;
+         $hdisk_info{$1}{vgactive}="yes";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      if (/^(hdisk[0-9]+) +([a-zA-Z0-9_]+) +active/){			#look for disks without a PVID in an "active" state
+         $hdisk_info{$1}{pvid}=" ";					#set empty value for PVID to avoid undef errors
+         $hdisk_info{$1}{vgname}=$2;
+         $hdisk_info{$1}{vgactive}="yes";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      if (/^(vpath[0-9]+) +([a-z0-9]{16}) +([a-zA-Z0-9_]+) +active/){	#look for disks with a PVID in an "active" state
+         $hdisk_info{$1}{pvid}=$2;
+         $hdisk_info{$1}{vgname}=$3;
+         $hdisk_info{$1}{vgactive} = "yes";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      if (/^(vpath[0-9]+) +([a-zA-Z0-9_]+) +active/){			#look for disks without a PVID in an "active" state
+         $hdisk_info{$1}{pvid}=" "; 					#set empty value for PVID to avoid undef errors
+         $hdisk_info{$1}{vgname}=$2;
+         $hdisk_info{$1}{vgactive} = "yes";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      #
+      # look for disks that are not in a volume group
+      #
+      if (/^(hdisk[0-9]+) +[a-z0-9]{16} +None +$/) {			#disks with a PVID
+         $hdisk_info{$1}{vgname} = "None";
+         $hdisk_info{$1}{vgactive} = "no";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      if (/^(hdisk[0-9]+) +None +$/) {					#disks without a PVID
+         $hdisk_info{$1}{vgname} = "None";
+         $hdisk_info{$1}{vgactive} = "no";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      if (/^(vpath[0-9]+) +[a-z0-9]{16} +None +$/) {			#disks with a PVID
+         $hdisk_info{$1}{vgname} = "None";
+         $hdisk_info{$1}{vgactive} = "no";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      if (/^(vpath[0-9]+) +None +$/) {					#disks without a PVID
+         $hdisk_info{$1}{vgname} = "None";
+         $hdisk_info{$1}{vgactive} = "no";
+         print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+      }									#end of if block
+      #
+      # Look for disks in a volume group that is varied off
+      # These disks will be missing the "active" column.  For example:
+      # $ lspv
+      # hdisk0          00f7ddd3433f6ee9                    rootvg          active
+      # hdisk1          00f7ddd382db149e                    testvg
+      #
+      #
+      if (/^(hdisk[0-9]+)/) { 					#find the line beginning with hdisk
+         next if ( $hdisk_info{$1}{vgactive} eq "yes" );	#skip for hdisks that we have already confirmed are in a varied on volume group
+         if (/ +active$/) {					#look for "active" at the end of the line
+            $hdisk_info{$1}{vgactive} = "yes";
+            print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+         } else {
+            $hdisk_info{$1}{vgactive} = "no";			#set a value of no if the disk is not in a varied-on volume group
+            print "      $hdisk_info{$1}{name} vgname=$hdisk_info{$1}{vgname} pvid=$hdisk_info{$1}{pvid} vgactive=$hdisk_info{$1}{vgactive} \n" if ($verbose eq "yes");
+         }                					#end of if/else block 
+      }                						#end of if block
+   }                                                            #end of while loop
+   close IN; 							#close filehandle
+   #
+   # Now let's see which disks are provided by a VIO server (ie connected to a vscsi adapter)
+   #
+   open(IN,"$lsdev |");        					#open filehandle using command output
+   while (<IN>) {                                		#read a line from filehandle
+      if ( /^(vscsi[0-9]+)/ ) {					#look for vscsi adapters
+         push (@vscsi,$1);					#add vscsi device to array
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   # Now that we have a list of all the vscsi adapters, look for hdisk child devices
+   #
+   @vscsi = sort(@vscsi);					#sort the array so the adapters are displayed in order
+   foreach $vscsi (@vscsi) {
+      next unless $vscsi;					#skip any blank array elements
+      print "   Checking for child devices on $vscsi \n" if ($verbose eq "yes");
+      open(IN,"$lsdev -p $vscsi |");				#open filehandle using command output 
+      while (<IN>) {                                		#read a line from filehandle
+         if ( /^(hdisk[0-9]+)/ ) {				#find disk that comes from a VIO server
+            $hdisk_info{$1}{fromvio}="yes";
+            print "      $1 comes from a VIO server over $vscsi \n" if ($verbose eq "yes");
+         }							#end of if block
+      }								#end of while loop
+      close IN;							#close filehandle
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+
+
+sub check_vscsi_adapter_settings {
+   # 
+   print "running check_vscsi_adapter_settings subroutine \n" if ($verbose eq "yes");
+   # 
+   # this section validates the settings on vscsi adapters on an LPAR connected to a VIO server
+   # The vscsi_err_recov and vscsi_path_to attributes were added with AIX 5.3 TL9 and AIX 6.1 TL2
+   #
+   # vscsi_path_to, when enabled, allows the virtual client adapter driver to determine the health of the VIO Server to improve and expedite path failover processing.
+   # A value of 0 (default) disables it, while any other value defines the number of seconds the VSCSI client adapter will wait for commands issued to the VSCSI server adapter that were not serviced meanwhile. 
+   # If that time is exceeded, the VSCSI client adapter attempts the commands again and waits up to 60 seconds until it fails the outstanding requests. 
+   # An error will be writen to the error log and, if MPIO is used, another path to the disk will be tried to service the requests. 
+   # Therefore, this parameter should only be set for MPIO installations with dual VIO servers.
+   #
+   # Similar to the attribute fc_error_recov for real FC adapters, the attribute vscsi_err_recov is used by the VSCSI adapter driver. 
+   # When this parameter is set to fast_fail, the VIO client adapter will send a FAST_FAIL datagram to the VIO server and it will subsequently fail the I/O immediately rather than delayed. 
+   # This may help to improve MPIO failover.
+   #
+   # We can see the vscsi adapter settings with the following command: 
+   #   $ lsattr -El vscsi0 
+   #   vscsi_err_recov fast_fail N/A                       True
+   #   vscsi_path_to   30        Virtual SCSI Path Timeout True
+   #
+   # 
+   # 
+   # We already have a fully populated @vscsi array from a previous subroutine, so no need to gather that info again. 
+   #open(IN,"$lsdev|");                                          #open filehandle using command output
+   #while (<IN>) {                                               #read a line from filehandle
+   #   if ( /^(vscsi[0-9]+)/ ) {                                 #look for fscsi devices (fibre channel adapters)
+   #      push (@vscsi,$1);                                      #add fscsi device to array
+   #   }                                                         #end of if block
+   #}                                                            #end of while loop
+   #close IN;                                                    #close filehandle
+   #
+   #
+   #
+   # Only run this check on AIX version 5.3TL9+ and AIX 6.1TL2+
+   # We already have a value in $oslevel, but it is in 5.3.0.0 format instead of 5300-12-04-1119 format.
+   open(OSLEVEL,"$oslevel -s|");                                #figure out what version of AIX we are using
+   while (<OSLEVEL>) {                                          #read a line from filehandle
+      chomp;							#remove newline
+      print "   oslevel is $_ \n" if ($verbose eq "yes");
+      if ( /([0-9]{4})\-([0-9]{2})\-/ ) {			#look for oslevel in 5300-12-04-1119 format
+         $oslevel = "$1$2";					#convert to 5300-12-04-1119 to 530012 (ie just AIX version and technology level)
+      }	
+   }                                                            #end of while block
+   close OSLEVEL;                                               #close filehandle
+   #
+   # Now that we know the AIX version and technology level, make sure it is recent enough to have the vscsi_path_to and vscsi_err_recov attributes
+   return if (  $oslevel < 530009 );				#attributes added with AIX 5.3 TL9, so break out of subroutine if AIX version too old
+   return if ( ($oslevel > 530009) && ($oslevel < 610002) );	#attributes added with AIX 6.1 TL2, so break out of subroutine if AIX version too old
+   #
+   #
+   #
+   # Only run this check if there are dual VIO servers (we just check for multiple vscsi adapters)
+   return if ( $#vscsi <= 1 );					#break out of this subroutine if there are less than 2 vscsi adapters (array element starts at zero)
+   #
+   # We only get this far if there are 2 or more vscsi adapters
+   #
+   foreach $vscsi (@vscsi) {					#loop through for each vscsi adapter
+      next if ( $vscsi eq "" );                                 #skip any blank array elements
+      print "   checking $vscsi \n" if ($verbose eq "yes");
+      open (IN,"$lsattr -El $vscsi |");                         #open filehandle using command output
+      while (<IN>) {                                            #read a line from filehandle
+         $vscsi_adapters{$vscsi}{vscsi_path_to}   = $1 if ( /^vscsi_path_to +([0-9]+)/ );              #look for the vscsi_path_to attribute and put into hash
+         $vscsi_adapters{$vscsi}{vscsi_err_recov} = $1 if ( /^vscsi_err_recov +([a-zA-Z0-9_]+)/ );       #look for the vscsi_err_recov attribute and put into hash
+      }                                                         #end of while loop
+      close IN;                                                 #close filehandle
+      print "   $vscsi vscsi_path_to=$vscsi_adapters{$vscsi}{vscsi_path_to} vscsi_err_recov=$vscsi_adapters{$vscsi}{vscsi_err_recov} \n" if ($verbose eq "yes");
+   }                                                            #end of foreach loop
+   #
+   # Now that we have a hash of all the vscsi adapters and their attributes, look for any problems. 
+   #
+   foreach $key (keys %vscsi_adapters) {       			#loop through for each vscsi adapter
+      next unless $key;                                         #skip any blank lines
+      #
+      if ( $vscsi_adapters{$key}{vscsi_path_to} == 0 ) {	#look for the attribute
+         print "$CHECK_NAME WARN - $key has attribute vscsi_path_to=$vscsi_adapters{$key}{vscsi_path_to}.  A value of 0 means that the health check is disabled.  This attribute is used to determine how many seconds a failed vscsi path will take to timeout.  To allow for rapid path failover, please fix up with: chdev -l $key -a vscsi_path_to=30   HINT: All paths to that vscsi adapter must be removed to make changes.  Check all your other vscsi adapters with lsattr -El vscsi# as well.\n";  
+         exit( $WARN );
+      }								#end of unless block
+      #
+      unless ( $vscsi_adapters{$key}{vscsi_path_to} == 30 ) {	#look for the attribute
+         print "$CHECK_NAME WARN - $key has attribute vscsi_path_to=$vscsi_adapters{$key}{vscsi_path_to}.  This attribute determines how many seconds a failed vscsi path will take to timeout.  To allow for rapid path failover, please fix up with: chdev -l $key -a vscsi_path_to=30   HINT: All paths to that vscsi adapter must be removed to make changes.  Check all your other vscsi adapters with lsattr -El vscsi# as well.\n";  
+         exit( $WARN );
+      }								#end of unless block
+      #
+      unless ( $vscsi_adapters{$key}{vscsi_err_recov} eq "fast_fail" ) {	#look for the attribute
+         print "$CHECK_NAME WARN - $key has attribute vscsi_path_to=$vscsi_adapters{$key}{vscsi_err_recov}.  This attribute determines how the MPIO driver will deal with vscsi path failures.  To allow for rapid path failover, please fix up with: chdev -l $key -a vscsi_err_recov=fast_fail   HINT: All paths to that vscsi adapter must be removed to make changes.  Check all your other vscsi adapters with lsattr -El vscsi# as well.\n";  
+         exit( $WARN );
+      }								#end of unless block
+      #
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+
+
+sub check_vscsi_disk_settings {
+   # 
+   # this section validates the settings on disks that are attached to vscsi devices
+   # this would be hdisk devices on an LPAR that is getting disk from a VIO server
+   #
+   # We can see the PCM (Path Control Module) with the following command: 
+   #   $ lsattr -El hdisk7 
+   #   PCM             PCM/friend/vscsi           Path Control Module 
+   #
+   print "running check_vscsi_disk_settings subroutine \n" if ($verbose eq "yes");
+   foreach $key (keys %hdisk_info) {        			#loop through for each hdisk device
+      next unless $key;                                         #skip any blank lines
+      if ( $hdisk_info{$key}{pcm} =~ /vscsi/ ) {		#look for disk with the PCM/friend/vscsi path control module 
+         #
+         print "   checking VIO-provided disk $key reserve_policy=$hdisk_info{$key}{reserve_policy} hcheck_interval=$hdisk_info{$key}{hcheck_interval} hcheck_mode=$hdisk_info{$key}{hcheck_mode} algorithm=$hdisk_info{$key}{algorithm} \n" if ($verbose eq "yes");
+         #
+         if ( $hdisk_info{$key}{reserve_policy} ne "no_reserve" ) {		#look for type of reserve_policy in use 
+            print "$CHECK_NAME WARN - $key is VIOS-provided disk with reserve_policy=$hdisk_info{$key}{reserve_policy}.  To allow for rapid path failover, please fix up with: chdev -l $key -a reserve_policy=no_reserve   HINT: check all your other VIOS-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} == 0 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is VIOS-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means the health check interval for failed paths is disabled.To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other VIOS-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} > 60 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is VIOS-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means disk on checks for the recovery of a failed path every $hdisk_info{$key}{hcheck_interval} seconds.  A more frequent check would be preferred.  Please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other VIOS-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_mode} ne "nonactive" ) {		#look for the health check mode (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is VIOS-provided disk with hcheck_mode=$hdisk_info{$key}{hcheck_mode}.  This means the health check mode is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_mode=nonactive   HINT: check all your other VIOS-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{algorithm} ne "fail_over" ) {		#look for the disk path failover algorithm (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is VIOS-provided disk with algorithm=$hdisk_info{$key}{algorithm}.  This means the disk path failover algorithm is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a algorithm=fail_over   HINT: check all your other VIOS-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+      }								#end of if block
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+
+sub check_ibm_sddpcm_disk_settings {
+   # 
+   # validate that any attached IBM disk using the SDDPCM driver has sane defaults 
+   # This would be SVC / DS8000 / Storwize 7000 disk  (or any other vendor disk behind and SVC)
+   #
+   # We can see the PCM (Path Control Module) with the following command: 
+   #   $ lsattr -El hdisk7 
+   #   PCM             PCM/friend/sddpcm           Path Control Module 
+   #
+   # We can also see that we are dealing with IBM disk like so: 
+   #   $ lscfg -vl hdisk7 
+   #   hdisk121         U78A0.001.DNWHCFR-P1-C5-T2-W500507680120B532-L3A000000000000  MPIO FC 2145
+   #
+   #     Manufacturer................IBM
+   #     Machine Type and Model......2145
+   #     ROS Level and ID............0000
+   #     Device Specific.(Z0)........0000043268101002
+   #     Device Specific.(Z1)........0200602
+   #     Serial Number...............60050768018085A9900000000000002A
+   #
+   #
+   #
+   #
+   print "running check_ibm_sddpcm_disk_settings subroutine \n" if ($verbose eq "yes");
+   foreach $key (keys %hdisk_info) {        			#loop through for each hdisk device
+      next unless $key;                                         #skip any blank lines
+      if ( $hdisk_info{$key}{pcm} =~ /sddpcm/ ) {		#look for disk with the sddpcm path control module 
+         #
+         print "   checking IBM disk $key reserve_policy=$hdisk_info{$key}{reserve_policy} hcheck_interval=$hdisk_info{$key}{hcheck_interval} hcheck_mode=$hdisk_info{$key}{hcheck_mode} algorithm=$hdisk_info{$key}{algorithm} \n" if ($verbose eq "yes");
+         #
+         if ( $hdisk_info{$key}{reserve_policy} ne "no_reserve" ) {		#look for type of reserve_policy in use 
+            print "$CHECK_NAME WARN - $key is IBM-provided disk with reserve_policy=$hdisk_info{$key}{reserve_policy}.  To allow for rapid path failover, please fix up with: chdev -l $key -a reserve_policy=no_reserve   HINT: check all your other IBM disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} == 0 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is IBM-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means the health check interval for failed paths is disabled.To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other IBM-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} > 60 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is IBM-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means disk on checks for the recovery of a failed path every $hdisk_info{$key}{hcheck_interval} seconds.  A more frequent check would be preferred.  Please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other IBM-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_mode} ne "nonactive" ) {		#look for the health check mode (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is IBM-provided disk with hcheck_mode=$hdisk_info{$key}{hcheck_mode}.  This means the health check mode is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_mode=nonactive   HINT: check all your other IBM-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{algorithm} ne "load_balance" ) {		#look for the disk path failover algorithm (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is IBM-provided disk with algorithm=$hdisk_info{$key}{algorithm}.  This means the disk path failover algorithm is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a algorithm=load_balance   HINT: check all your other IBM-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+      }								#end of if block
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+sub check_emc_disk_settings {
+   # 
+   # validate that any attached EMC disk has sane defaults 
+   # check to see if EMC ODM add-on for AIX is installed.  
+   # this extends the built-in AIX MPIO so it can understand EMC disk 
+   # Note that this is specifically NOT for systems using EMC PowerPath for multipathing 
+   #
+   # We can see the PCM (Path Control Module) with the following command:  (these examples show EMC Symmetrix and Clariion/VNX)
+   #   $ lsattr -El hdisk7 
+   #   PCM             PCM/friend/MSYMM_RAID5     <---- this example shows EMC Symmetrix disk
+   #
+   #   $ lsattr -El hdisk28
+   #   PCM             PCM/friend/MCLAR_VDISK     <---- this example shows EMC Clariion / VNX storagE
+
+   # We can also see that we are dealing with EMC disk like so: 
+   #   $ lscfg -vl hdisk7 
+   #   hdisk7 
+   #   U78A5.001.WIH5BFE-P1-C12-T1-W5006048AD52DA868-LF2000000000000  EMC Symmetrix FCP MPIO Raid5 
+   #     Manufacturer................EMC
+   #     Machine Type and Model......SYMMETRIX
+   #
+   #   $ lscfg -vl hdisk28
+   #    hdisk28          U78AA.001.WZSHTTW-P1-C4-T1-W5006016036E01B11-L83000000000000  EMC CLARiiON FCP MPIO VRAID Disk
+   #     Manufacturer................DGC
+   #     Machine Type and Model......VRAID
+   #     Subsystem Vendor/Device ID..VNX5400
+   #
+   #
+   # As of 2010, the default reserve_policy on EMC disk was single_path
+   # This means that a SCSI reserve is put on a single path, so if there is a path failure, 
+   # the disk wil not failover to an alternate path.  You should change the default reserve_policy
+   # to no_reserve     
+   #
+   #
+   print "running check_emc_disk_settings subroutine \n" if ($verbose eq "yes");
+   foreach $key (keys %hdisk_info) {        			#loop through for each hdisk device
+      next unless $key;                                         #skip any blank lines
+      if ( ($hdisk_info{$key}{pcm} =~ /MSYMM/) || ($hdisk_info{$key}{pcm} =~ /MCLAR/) ) {		#look for disk with the MSYMM or MCLAR path control module 
+         #
+         print "   checking EMC disk $key reserve_policy=$hdisk_info{$key}{reserve_policy} hcheck_interval=$hdisk_info{$key}{hcheck_interval} hcheck_mode=$hdisk_info{$key}{hcheck_mode} algorithm=$hdisk_info{$key}{algorithm} \n" if ($verbose eq "yes");
+         #
+         if ( $hdisk_info{$key}{reserve_policy} ne "no_reserve" ) {		#look for type of reserve_policy in use 
+            print "$CHECK_NAME WARN - $key is EMC disk with reserve_policy=$hdisk_info{$key}{reserve_policy}.  To allow for rapid path failover, please fix up with: chdev -l $key -a reserve_policy=no_reserve   HINT: check all your other EMC disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} == 0 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is EMC-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means the health check interval for failed paths is disabled.To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other EMC-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} > 60 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is EMC-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means disk on checks for the recovery of a failed path every $hdisk_info{$key}{hcheck_interval} seconds.  A more frequent check would be preferred.  Please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other EMC-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_mode} ne "nonactive" ) {		#look for the health check mode (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is EMC-provided disk with hcheck_mode=$hdisk_info{$key}{hcheck_mode}.  This means the health check mode is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_mode=nonactive   HINT: check all your other EMC-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{algorithm} ne "fail_over" ) {		#look for the disk path failover algorithm (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is EMC-provided disk with algorithm=$hdisk_info{$key}{algorithm}.  This means the disk path failover algorithm is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a algorithm=fail_over   HINT: check all your other EMC-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+      }								#end of if block
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+sub check_netapp_disk_settings {
+   # 
+   # validate that any attached netapp disk has sane defaults 
+   #
+   # We can see the PCM (Path Control Module) with the following command: 
+   #  # lsattr -El hdisk45
+   #  PCM             PCM/friend/OntapDefaultPCM Path Control Module              False
+   #  algorithm       round_robin                Algorithm                        True
+   #  clr_q           no                         Device CLEARS its Queue on error True
+   #  dist_err_pcnt   0                          Distributed Error Sample Time    True
+   #  dist_tw_width   50                         Distributed Error Sample Time    True
+   #  hcheck_cmd      inquiry                    Health Check Command             True
+   #  hcheck_interval 30                         Health Check Interval            True
+   #  hcheck_mode     nonactive                  Health Check Mode                True
+   #  location                                   Location Label                   True
+   #  lun_reset_spt   yes                        LUN Level Reset                  True
+   #  max_transfer    0x40000                    Maximum TRANSFER Size            True
+   #  node_name       0x500a0980893b3874         FC Node Name                     False
+   #  pvid            none                       Physical volume identifier       False
+   #  q_err           yes                        Use QERR bit                     True
+   #  q_type          simple                     Queuing TYPE                     True
+   #  queue_depth     12                         Queue DEPTH                      True
+   #  reassign_to     120                        REASSIGN time out value          True
+   #  reserve_policy  no_reserve                 Reserve Policy                   True
+   #  rw_timeout      30                         READ/WRITE time out value        True
+   #  scsi_id         0x10b00                    SCSI ID                          False
+   #  start_timeout   60                         START unit time out value        True
+   #
+   #
+   #
+   # We can also see that we are dealing with NetApp disk like so: 
+   #  $ lscfg -vl hdisk45
+   #   hdisk45          U78A5.001.WIH8FA3-P1-C20-L1-T1-W500A0984993B3874-L2B000000000000  MPIO Ontap FCP Default PCM Disk
+   #     Manufacturer................NETAPP
+   #     Machine Type and Model......LUN
+   #     ROS Level and ID............7310
+   #     Serial Number...............W-NpkZZxTrUG
+   #     Device Specific.(Z0)........N6040
+   #
+   #
+   #
+   print "running check_netapp_disk_settings subroutine \n" if ($verbose eq "yes");
+   foreach $key (keys %hdisk_info) {        			#loop through for each hdisk device
+      next unless $key;                                         #skip any blank lines
+      if ( $hdisk_info{$key}{pcm} =~ /Ontap/ ) {		#look for disk with the Ontap path control module 
+         #
+         print "   checking netapp disk $key reserve_policy=$hdisk_info{$key}{reserve_policy} hcheck_interval=$hdisk_info{$key}{hcheck_interval} hcheck_mode=$hdisk_info{$key}{hcheck_mode} algorithm=$hdisk_info{$key}{algorithm} \n" if ($verbose eq "yes");
+         #
+         #
+         if ( $hdisk_info{$key}{reserve_policy} ne "no_reserve" ) {		#look for type of reserve_policy in use 
+            print "$CHECK_NAME WARN - $key is NetApp disk with reserve_policy=$hdisk_info{$key}{reserve_policy}.  To allow for rapid path failover, please fix up with: chdev -l $key -a reserve_policy=no_reserve   HINT: check all your other NetApp disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} == 0 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is NetApp-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means the health check interval for failed paths is disabled.To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other NetApp-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_interval} > 60 ) {		#look for the health check interval 
+            print "$CHECK_NAME WARN - $key is NetApp-provided disk with hcheck_interval=$hdisk_info{$key}{hcheck_interval}.  This means disk on checks for the recovery of a failed path every $hdisk_info{$key}{hcheck_interval} seconds.  A more frequent check would be preferred.  Please fix up with: chdev -l $key -a hcheck_interval=30   HINT: check all your other NetApp-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{hcheck_mode} ne "nonactive" ) {		#look for the health check mode (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is NetApp-provided disk with hcheck_mode=$hdisk_info{$key}{hcheck_mode}.  This means the health check mode is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a hcheck_mode=nonactive   HINT: check all your other NetApp-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+         if ( $hdisk_info{$key}{algorithm} ne "round_robin" ) {		#look for the disk path failover algorithm (differs by disk subsystem)
+            print "$CHECK_NAME WARN - $key is NetApp-provided disk with algorithm=$hdisk_info{$key}{algorithm}.  This means the disk path failover algorithm is not the default.  To allow for rapid path failover, please fix up with: chdev -l $key -a algorithm=round_robin   HINT: check all your other NetApp-provided disks with lsattr -El hdisk#  as well, because this change requires a reboot to take effect.\n";  
+         exit( $WARN );
+         }							#end of if block
+         #
+         #
+      }								#end of if block
+   }								#end of foreach block
+}								#end of subroutine
+
+
+
+
+sub sdd_sanity_checks {
+   #
+   # see if SDD drivers are installed
+   #
+   # NOTE: The sdd driver is only readable by root, so we'll need to setup sudo for this to work.  See the 
+   #       documentation at the top of this script for more details.
+   #
+   # NOTE: The SDD driver is considered obsolete in 2008, and has largely been replaced by MPIO
+   #
+   print "running sdd_sanity_checks subroutine \n" if ($verbose eq "yes");
+   # see if the fileset is installed - looking for devices.sdd.53.rte fileset.  53 is the AIX version, so look for other numbers as well.
+   $sdd_installed = "no";						#initialize variable
+   open(IN,"$lslpp -l |");    						#open filehandle using command output
+   while (<IN>) {                                               	#read a line from filehandle
+      $sdd_installed = "yes" if ( /devices\.sdd\.[0-9]+\.rte/ ); #look for the installed fileset
+   }									#end of while loop
+   unless ( $sdd_installed eq "yes" ) {
+      print "   Skipping SDD checks - devices.sdd.##.rte fileset is not installed \n" if ($verbose eq "yes");
+      return;								#break out of subroutine if fileset is not installed
+   }									#end of unless block
+   #
+   # Confirm the $datapath binary exists
+   return unless ( -f "$datapath" );					#break out of subroutine if the datapath binary cannot be found
+   #
+   # Check to see if nagios user has execute permission to the $datapath binary 
+   #
+   if ( ! -x "$datapath" ) { 					#see if nagios user has execute permission	
+      #
+      # If the nagios user does not have execute permission on the $datapath binary, 
+      # see if we can access the file using sudo.
+      #
+      $sudo = "/usr/bin/sudo"        if ( -e "/usr/bin/sudo" );		#location of sudo binary
+      $sudo = "/usr/local/bin/sudo"  if ( -e "/usr/local/bin/sudo" );	#location of sudo binary
+      #
+      if ( ! -e $sudo ) {
+         print "$CHECK_NAME UNKNOWN - cannot find the sudo binary $sudo.  By default, only the root user has access to the $datapath binary, so we use sudo to allow this check to proceed.  Please setup sudo to allow the nagios user to execute the $datapath binary. \n";  
+         exit( $UNKNOWN );
+      }
+      if ( ! -x $sudo ) {
+         print "$CHECK_NAME UNKNOWN - the sudo binary $sudo is not executable by the nagios user.  By default, only the root user has access to the $datapath binary, so we use sudo to allow this check to proceed.  Please setup sudo to allow the nagios user to execute the $datapath binary. See documentation embedded in this script for details.\n";  
+         exit( $UNKNOWN );
+      }
+      if ( ! -e "/etc/sudoers" ) {
+         print "$CHECK_NAME UNKNOWN - cannot find /etc/sudoers file.  By default, only the root user has access to the $datapath binary, so we use sudo to allow this check to proceed.  Please setup sudo to allow the nagios user to execute the $datapath binary. \n";  
+         exit( $UNKNOWN );
+      }
+   }
+}								#end of subroutine
+
+
+
+sub sdd_adapter_checks {
+   #
+   #
+   # see if any adapters have failed
+   # Sample command output should look like this if one adapter has failed:
+   #    $ datapath query adapter
+   #
+   #    Active Adapters :2
+   #
+   #    Adpt#     Name   State     Mode             Select     Errors  Paths  Active
+   #     0   fscsi1  NORMAL   ACTIVE             427464          0      8       8
+   #     1   fscsi0  FAILED   ACTIVE             427685          33     8       0
+   #
+   #
+   print "running sdd_adapter_checks subroutine \n" if ($verbose eq "yes");
+   return unless ( $sdd_installed eq "yes" );				#break out of subroutine if fileset is not installed
+   return unless ( -e "$datapath" );					#break out of subroutine if datapath binary cannot be found
+   $sdd_adapter_status = open(IN,"$sudo $datapath query adapter |"); 	#open filehandle using command output
+   while (<IN>) {							#read a line from filehandle
+      next if ( /^Active Adapters/ );   				#skip header line
+      next if ( /^Adpt/ ); 	  					#skip header line
+      if ( /([0-9]+) +(fscsi[0-9]+) +([A-Z]+) +([A-Z]+) +([0-9]+) +([0-9]+) +([0-9]+) +([0-9]+)/ ){
+         $sdd_adapter_num    = $1;					#assign more mnemonic variable name
+         $sdd_adapter_name   = $2;					#assign more mnemonic variable name
+         $sdd_adapter_state  = $3;					#assign more mnemonic variable name
+         $sdd_adapter_mode   = $4;					#assign more mnemonic variable name
+         $sdd_adapter_select = $5;					#assign more mnemonic variable name
+         $sdd_adapter_errors = $6;					#assign more mnemonic variable name
+         $sdd_adapter_paths  = $7;					#assign more mnemonic variable name
+         $sdd_adapter_active = $8;					#assign more mnemonic variable name
+         #
+         # check for an adapter in "FAILED" state
+         #
+         if ( $sdd_adapter_state ne "NORMAL" ) {
+            print "$CHECK_NAME CRITICAL - $sdd_adapter_name is in $sdd_adapter_state state.  Please check output of the following command: datapath query adapter \n";
+            exit( $CRITICAL );
+         }								#end of if block
+      }									#end of if block
+   }									#end of while loop
+   close IN;								#close filehandle
+}									#end of subroutine
+
+
+
+sub sdd_vpath_checks {
+   #
+   # If we get this far, we know the scsi adapters are fine.
+   # Now check that status of each vpath.
+   #
+   print "running sdd_vpath_checks subroutine \n" if ($verbose eq "yes");
+   # initialize counters
+   $vpath_count       = 0;
+   $vpath_open        = 0;
+   $vpath_close       = 0;
+   $vpath_closed_dead = 0;
+   $vpath_dead        = 0;
+   $vpath_invalid     = 0;
+   #
+   return unless ( $sdd_installed eq "yes" );				#break out of subroutine if fileset is not installed
+   return unless ( -f "$datapath" );					#break out of subroutine if SDD driver not installed
+   $sdd_adapter_status = open(IN,"$sudo $datapath query device |");    	#open filehandle using command output
+   while (<IN>) {                                             	  	#read a line from filehandle
+      next if ( /^SERIAL/ );    					#skip header line
+      next if ( /^==========/ );    					#skip header line
+      next if ( /^Path/ );   	 					#skip header line
+      $vpath_count++       if ( /^DEV#/ ); 				#count number of vpath devices
+      $vpath_open++        if ( /OPEN   NORMAL/ );			#count number of open paths
+      $vpath_close++       if ( /CLOSE   NORMAL/ );			#count number of closed paths
+      $vpath_closed_dead++ if ( /CLOSED_DEAD   OFFLINE/ );		#count number of closed dead paths
+      $vpath_dead++        if ( /DEAD   OFFLINE/ );			#count number of dead paths
+      $vpath_invalid++     if ( /INVALID   NORMAL/ );			#count number of invalid paths
+   }									#end of while loop
+   close IN;								#close filehandle
+   #
+   # Alert if problems were found with vpaths
+   #
+   if ( $vpath_closed_dead > 0) {
+      print "$CHECK_NAME CRITICAL - $vpath_count total vpath devices / $vpath_open open paths / $vpath_close closed paths / $vpath_closed_dead closed dead paths / $vpath_dead dead paths / $vpath_invalid invalid paths.  Please check the output of: datapath query device \n";
+      exit( $CRITICAL );
+   }
+   elsif ( $vpath_dead > 0 ) {
+      print "$CHECK_NAME CRITICAL - $vpath_count total vpath devices / $vpath_open open paths / $vpath_close closed paths / $vpath_closed_dead closed dead paths / $vpath_dead dead paths / $vpath_invalid invalid paths.  Please check the output of: datapath query device \n";
+      exit( $CRITICAL );
+   }
+   elsif ( $vpath_invalid > 0 ) {
+      print "$CHECK_NAME CRITICAL - $vpath_count total vpath devices / $vpath_open open paths / $vpath_close closed paths / $vpath_closed_dead closed dead paths / $vpath_dead dead paths / $vpath_invalid invalid paths.  Please check the output of: datapath query device \n";
+      exit( $CRITICAL );
+   }
+}								#end of subroutine
+
+
+
+sub check_rootvg_disks {
+   #
+   # confirm rootvg disk is set up correctly
+   # A common practice is to present two hdisks from local disk
+   # on redundant VIO servers, then mirror them at the LVM level on the AIX LPAR.  This makes it
+   # look like we only have a single vscsi adapter for each disk, but we are still protected 
+   # because we have 2 hdisks mirrored together.  However, if there is only 1 disk in rootvg, we
+   # want to make sure it has at least 2 paths.
+   #
+   print "running check_rootvg_disks subroutine \n" if ($verbose eq "yes");
+   $rootvg_num_disks = 0;					#initialize variable
+   foreach $key (keys %hdisk_info) {            		#loop through for each hdisk
+      next unless $key;                                         #skip any blank lines
+      next unless $hdisk_info{$key}{vgname};       			#skip any hash entries that do not have a volume group defined
+      #
+      # count up all the disks in rootvg
+      #
+      if ( $hdisk_info{$key}{vgname} eq "rootvg" ) {		#look for disks in rootvg
+         $rootvg_num_disks++;					#increment counter 
+      }								#end of if block
+   }                                                            #end of foreach loop
+   #
+   # this section only gets run if there are >=2 disks in rootvg
+   #
+   if ( $rootvg_num_disks >= 2 ) {				#if there are 2 or more disks in rootvg, confirm they are mirrored at the LVM layer
+      open(IN,"$lsvg -l rootvg |");    				#open filehandle using command output
+      while (<IN>) {                                		#read a line from filehandle
+         #
+         # confirm all logical volumes are mirrored
+         #
+         # There should be output similar to the following.  When the hdisks are mirrored
+         # at the LVM layer, the PP's should be twice as many as the LP's.
+         #
+         # $lsvg -l rootvg
+         # rootvg:
+         # LV NAME             TYPE       LPs     PPs     PVs  LV STATE      MOUNT POINT
+         # hd5                 boot       1       1       1    closed/syncd  N/A
+         # hd6                 paging     512     512     1    open/syncd    N/A
+         # hd8                 jfs2log    1       1       1    open/syncd    N/A
+         # hd4                 jfs2       96      96      1    open/syncd    /
+         # hd2                 jfs2       224     224     1    open/syncd    /usr
+         # hd9var              jfs2       32      32      1    open/syncd    /var
+         # hd3                 jfs2       64      64      1    open/syncd    /tmp
+         # hd1                 jfs2       32      32      1    open/syncd    /home
+         # hd10opt             jfs2       13      13      1    open/syncd    /opt
+         # hd11admin           jfs2       4       4       1    open/syncd    /admin
+         # lg_dumplv           sysdump    32      32      1    open/syncd    N/A
+         # livedump            jfs2       8       8       1    open/syncd    /var/adm/ras/livedump
+         #
+         #
+         next if ( /^rootvg:/ );				#skip header line
+         next if ( /^LV NAME/ );				#skip header line
+         if ( /^([a-zA-Z0-9_]+) +([a-z0-9]+) +([0-9]+) +([0-9]+) +([0-9]+)/ ) {
+            $lv_name = $1;					#assign more mnemonic variable name
+            $lv_type = $2;					#assign more mnemonic variable name
+            $lv_lps  = $3;					#assign more mnemonic variable name
+            $lv_pps  = $4;					#assign more mnemonic variable name
+            $lv_pvs  = $5;					#assign more mnemonic variable name
+            #
+            if ( ($lv_pvs < $rootvg_num_disks) && ($lv_type ne "sysdump" ) ) {		#see if logical volume is spread across fewer disks that # of disks in rootvg  (except for sysdump which does not get mirrored)
+               print "$CHECK_NAME WARN - There are $rootvg_num_disks disks in rootvg, but the $lv_name logical volume is only spread across $lv_pvs physical volumes.  Either reduce rootvg to a single physical volume, or mirror all the logical volumes with the mirrorvg command. \n";
+               exit( $WARN );
+            }							#end of if block 
+         }							#end of if block
+      }                                                         #end of while loop
+      close IN; 						#close filehandle
+   }								#end of if block
+}								#end of subroutine
+
+
+
+
+
+sub mpio_sanity_checks {
+   #
+   # see if MPIO drivers are installed
+   # NOTE: Since the MPIO drivers are bundled with AIX 5300-05-00 and higher, they will be probably exist
+   #
+   print "running mpio_sanity_checks subroutine \n" if ($verbose eq "yes");
+   return unless ( -e "$lspath" );		#break out of subroutine if $lspath binary does not exist
+   #
+   # confirm the nagios user has execute permissions to $lspath binary
+   #
+   if ( ! -x "$lspath" ) {
+      print "$CHECK_NAME UNKNOWN - nagios user does not have execute permission to $lspath \n";
+      exit( $UNKNOWN );
+   }
+   #
+   #
+   # see if any adapters have failed
+   # Sample command output should look like this if one path has failed.  Please note that in this example, we are 
+   # using vscsi adapters that connect to a pair of redundant VIO servers.  Note that the third column shows the 
+   # parent is a "vscsi" device.  This is a "virtual client SCSI adapter" connected to a VIO server.
+   #   $ lspath
+   #   Enabled hdisk0 vscsi0
+   #   Missing hdisk1 vscsi1
+   #   Enabled hdisk2 vscsi0
+   #   Missing hdisk2 vscsi1
+   #   Enabled hdisk3 vscsi0
+   #   Missing hdisk3 vscsi1
+   #   Enabled hdisk4 vscsi0
+   #   Missing hdisk4 vscsi1
+   #
+   # Here is another example that shows "fscsi" devices instead of "vscsi" devices.  This is an example of
+   # a system that has physical fibre channel adapters (fcs0, fcs1).  The fscsi adapters are children of the fcs#
+   # adapters.
+   #   $ lspath
+   #   Enabled hdisk2   fscsi0
+   #   Enabled hdisk2   fscsi0
+   #   Enabled hdisk2   fscsi1
+   #   Enabled hdisk2   fscsi1
+   #   Enabled hdisk3   fscsi0
+   #   Enabled hdisk3   fscsi0
+   #   Enabled hdisk3   fscsi1
+   #   Enabled hdisk3   fscsi1
+   #
+   # Here is an example that shows disks assigned to a local physical SCSI adapter (rather than a fibre channel
+   # adapter or VIO).  Please note the third column is "scsi#" instead of "vscsi#" or "fscsi#".  You may also 
+   # notice that we have only a single path to each device.  That is normal, because we're not going through
+   # a SAN fabric to get to these disks.
+   #   $ lspath
+   #   Enabled hdisk0 scsi0
+   #   Enabled hdisk1 scsi0
+   #
+   # Here is an example that shows disks assigned to a local physical SAS adapter (rather than a fibre channel
+   # adapter or VIO).  Please note the third column is "sas#" instead of "vscsi#" or "fscsi#".  You may also 
+   # notice that we have only a single path to each device.  That is normal, because we're not going through
+   # a SAN fabric to get to these disks.
+   #   $ lspath
+   #   Enabled hdisk0 sas0
+   #   Enabled hdisk1 sas0
+   #
+   # Figure out which disks we do not have to check.
+   # We do not want to check disks in a volume group that is varied off, or disks not in a volume group
+   #
+   #
+   #
+   #
+   @hdisks_to_skip = "";					#initialize array
+   foreach $key (keys %hdisk_info) {                            #loop through for each hdisk device
+      #
+      # This will also catch SDD disks, as the vpath will belong to the volume group, but not the hdisks.
+      #
+      next unless ( $hdisk_info{$key} );			#skip blank lines
+      next unless ( $hdisk_info{$key}{vgname} );		#skip disks that do not have a volume group entry in the hash
+      if ( $hdisk_info{$key}{vgname} eq "None" ) {
+         print "   adding disk $key to hdisks_to_skip array because it is not in a volume group \n" if ($verbose eq "yes");
+         push (@hdisks_to_skip,$key);
+      }								#end of if block
+      #
+      # Skip disks that belong to a volume group that is not active.
+      # This could be a varied off volume group on an AIX LPAR, or a vscsi vdev mapping on a VIOS
+      # We find these disks by looking for the "active" column in the lspv output
+      #
+      if ( $hdisk_info{$key}{vgactive} eq "no" ) {
+         print "   adding disk $key to hdisks_to_skip array because it is not in a varied on volume group \n" if ($verbose eq "yes");
+         push (@hdisks_to_skip,$key);
+      }								#end of if block   
+   }                                                            #end of foreach loop
+   close IN; 							#close filehandle
+   #
+   # skip any disks that are attached to local SCSI adapters because those disks will never have multiple paths
+   #
+   # figure out how many scsi and/or sas adapters exist 
+   open(IN,"$lsdev|");   					#open filehandle using command output
+   while (<IN>) {                                		#read a line from filehandle
+      if ( /^(scsi[0-9]+)/ ) {					#look for devices named scsi??
+         print "   Found local scsi adapter $1 \n" if ($verbose eq "yes");
+         push (@scsi,$1);					#add scsi adapter to array
+      }								#end of if block
+      if ( /^(sas[0-9]+)/ ) {					#look for devices named scsi??
+         print "   Found local sas adapter $1 \n" if ($verbose eq "yes");
+         push (@sas,$1);					#add scsi adapter to array
+      }								#end of if block
+   }								#end of while loop
+   close IN; 							#close filehandle
+   #
+   # see if any disks are attached to local scsi adapters
+   #
+   foreach $scsi (@scsi) {					#loop through all the scsi devices
+      next if ( $scsi eq "" );					#skip any blank array elements
+      open (IN,"$lsdev -p $scsi |");				#open filehandle using command output
+      while (<IN>) {						#read a line from filehandle
+         if ( /^(hdisk[0-9]+)/ ){				#look for hdisks attached to local scsi adapters 
+            $hdisk = $1;					#assign more mnemonic variable name
+            print "   Adding scsi-connected $1 to hdisks_to_skip array \n" if ($verbose eq "yes");
+            push (@hdisks_to_skip,$hdisk);			#add disks on local scsi adapters to array to be skipped 
+         }							#end of if block
+      }								#end of while loop
+      close IN;							#close filehandle
+   }								#end of foreach block
+   #
+   # see if any disks are attached to local sas adapters
+   #
+   foreach $sas (@sas) {					#loop through all the scsi devices
+      next if ( $sas eq "" );					#skip any blank array elements
+      open (IN,"$lsdev -p $sas |");				#open filehandle using command output
+      while (<IN>) {						#read a line from filehandle
+         if ( /^(hdisk[0-9]+)/ ){				#look for hdisks attached to local sas adapters 
+            $hdisk = $1;					#assign more mnemonic variable name
+            print "   Adding sas-connected $1 to hdisks_to_skip array \n" if ($verbose eq "yes");
+            push (@hdisks_to_skip,$hdisk);			#add disks on local sas adapters to array to be skipped 
+         }							#end of if block
+      }								#end of while loop
+      close IN;							#close filehandle
+   }								#end of foreach block
+   #
+   # There may be some duplicates in the @hdisks_to_skip array.
+   # For example, hdisk0 may be a rootvg disk, and it may also be
+   # connected to the local scsi adapter scsi0.  This would have caused
+   # the hdisk to be added to the @hdisks_to_skip array more than once.
+   # Clean up the array by removing any duplicate values.
+   # This would be easier if perl 5.x had a built-in "uniq" function.
+   #
+   if ( @hdisks_to_skip ) {
+      %hdisks_to_skip = map { $_, 1 } @hdisks_to_skip;		#stick all the array elements into a hash (each element is a hash key)
+      @hdisks_to_skip = keys %hdisks_to_skip;			#take all the (newly unique-ified hash keys) and stuff them into the array
+      @hdisks_to_skip = sort(@hdisks_to_skip);			#sort the array
+      print "   the hdisks_to_skip array contains: \n@hdisks_to_skip \n" if ($verbose eq "yes");  
+   }
+   #
+   #
+   # This section will build an array containing the MPIO disks that we want to check
+   open(IN,"$lspath|");                                		#open filehandle using command output
+   while (<IN>) {                                               #read a line from filehandle
+      if ( /.* (hdisk[0-9]+)/ ){                                #find each hdisk
+        $hdisk = $1;                                            #assign more mnemonic variable name
+        next unless @hdisks_to_skip;				#skip if the @hdisks_to_skip array is empty
+        next if ( grep ( /^$hdisk$/,@hdisks_to_skip) );		#skip hdisks we do not care about
+        push (@hdisks,$hdisk);                                  #build an array containing all hdisks that use MPIO
+      }                                                         #end of if block
+   }                                                            #end of while loop
+   close IN;							#close filehandle
+   #
+   # the @hdisks array will contain duplicates, so unique-ify the array
+   #
+   if ( @hdisks ) {
+      %hdisks = map { $_, 1 } @hdisks;				#stick all the array elements into a hash (each element is a hash key)
+      @hdisks = keys %hdisks;					#take all the (newly unique-ified hash keys) and stuff them into the array
+      @hdisks = sort(@hdisks);					#sort the array
+      print "   the hdisks array contains: \n@hdisks \n" if ($verbose eq "yes");  
+   }
+}								#end of subroutine
+
+
+
+
+sub mpio_adapter_checks {
+   #
+   # This section will confirm that each disk is connected to at least two fscsi or vscsi adapters.
+   #
+   # Validate that we have at least 2 paths on 2 different adapters to each hdisk that uses MPIO
+   # This is to confirm we do not have a single point of failure (ie single disk path or single adapter with multiple paths) 
+   #
+   #
+   print "running mpio_adapter_checks subroutine \n" if ($verbose eq "yes");
+   foreach $hdisk (@hdisks) {
+      #
+      # confirm each hdisk has paths to a minimum of 2 vscsi or fscsi adapters
+      # (vscsi if VIO'd, fscsi if real FC adapters exist, scsi or sas for local scsi adapters)
+      #
+      # A disk cannot have multiple paths to scsi adapters, only fscsi|vscsi, so skip
+      # any disks connected to local scsi adapters.
+      next unless ( $hdisk =~ /hdisk/ );				#confirm we have a valid hdisk name 
+      next if ( `$lspath -l $hdisk` =~ /Enabled +$hdisk +scsi[0-9]+/ );	#look for scsi adapters
+      #
+      $mpio_adapter_count = 0;						#initialize variable
+      open(IN,"$lspath -l $hdisk | $uniq |");  				#open filehandle using command output
+      while (<IN>) {     						#read a line from filehandle
+         $mpio_adapter_count++ if ( /Enabled +$hdisk +vscsi[0-9]+/ );	#increment counter for fscsi adapters (fibre channel)
+         $mpio_adapter_count++ if ( /Enabled +$hdisk +fscsi[0-9]+/ );	#increment counter for vscsi adapters (VIO)
+      }									#end of while loop
+      close IN;								#close filehandle
+      #  
+      #
+      # send alert if there are less than 2 adapters for the current hdisk
+      #
+      if ( $mpio_adapter_count < 2 ) {
+         next if ( $lpar_type eq "lpar_under_hmc" && $blade eq "yes" && $vscsi_count == 1 );		    #skip VIO-provided disks from IVM because there will only be 1 path
+         next if ( ($hdisk_info{$hdisk}{vgname} eq "rootvg") && ($hdisk_info{$hdisk}{fromvio} eq "yes") ) ; #skip VIO-provided disks in rootvg because they might be mirrored at LVM layer
+         #
+         print "$CHECK_NAME WARN - $hdisk has Enabled paths to $mpio_adapter_count different adapters.  This means the adapter is a single point of failure.  Please add another adapter path to this disk.\n";
+         exit( $WARN );
+      }									#end of if block
+      #
+      # confirm each hdisk has at least two enabled paths (we have already confirmed at least 2 adapters exist) 
+      #
+      $mpio_path_count = 0;						#initialize variable
+      open(IN,"$lspath -l $hdisk|");	  				#open filehandle using command output
+      while (<IN>) {     						#read a line from filehandle
+         $mpio_path_count++ if ( /Enabled +$hdisk +vscsi[0-9]+/ );	#increment counter for paths on fscsi adapters
+         $mpio_path_count++ if ( /Enabled +$hdisk +fscsi[0-9]+/ );	#increment counter for paths on vscsi adapters
+      }									#end of while loop
+      close IN;								#close filehandle
+      #
+      # send alert if there are less than 2 paths for the current hdisk
+      #
+      if ( $mpio_path_count < 2 ) {
+         unless ( ($hdisk_info{$hdisk}{vgname} eq "rootvg") && ($hdisk_info{$hdisk}{fromvio} eq "yes") ) { #skip VIO-provided disks in rootvg because they might be mirrored at LVM layer
+            print "$CHECK_NAME WARN - $hdisk has $mpio_path_count path(s) in the Enabled state.  This is a single point of failure.  Please add another path to this disk.\n";
+            exit( $WARN );
+         }								#end of unless block
+      }									#end of if block
+   }									#end of foreach loop
+}									#end of subroutine
+
+
+
+
+sub mpio_path_checks {
+   #
+   # 
+   # This section will confirm that each disk has at least two paths in the "Enabled" state
+   #
+   # initialize counters
+   # 
+   print "running mpio_path_checks subroutine \n" if ($verbose eq "yes");
+   $mpio_state_enabled  = 0;
+   $mpio_state_missing  = 0;
+   $mpio_state_failed   = 0;
+   $mpio_state_disabled = 0; 
+   $mpio_state_defined  = 0; 
+   $mpio_state_unknown  = 0; 
+   #
+   open(IN,"$lspath |");  					#open filehandle using command output
+   while (<IN>) {                                               #read a line from filehandle
+      if ( /(Enabled|Missing|Failed|Disabled|Defined|Unknown) +(hdisk[0-9]+) +([a-zA-Z0-9]+)/ ){
+         $mpio_state  = $1; 					#assign more mnemonic variable name
+         $mpio_disk   = $2; 					#assign more mnemonic variable name
+         $mpio_parent = $3;  					#assign more mnemonic variable name
+         #
+         # count up each different state
+         #
+         $mpio_state_enabled++  if ( $mpio_state eq "Enabled"  );
+         $mpio_state_missing++  if ( $mpio_state eq "Missing"  );
+         $mpio_state_failed++   if ( $mpio_state eq "Failed"   );
+         $mpio_state_disabled++ if ( $mpio_state eq "Disabled" );
+         $mpio_state_defined++  if ( $mpio_state eq "Defined"  );
+         $mpio_state_unknown++  if ( $mpio_state eq "Unknown"  );
+      }								#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   # generate alerts if necessary for MPIO path problems
+   #
+   if (($mpio_state_enabled==0) && ($mpio_state_missing==0) && ($mpio_state_failed==0) && ($mpio_state_disabled== 0)){
+      print "$CHECK_NAME OK - nothing to do.  No MPIO or SDD disks exist on this system.\n";
+      exit( $OK );
+   }  
+   elsif ( $mpio_state_failed > 0 ) {
+      print "$CHECK_NAME CRITICAL - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown. \n";
+      exit( $CRITICAL );
+   }  
+   elsif( $mpio_state_missing > 0 ) {
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      exit( $WARN );
+   } 
+   elsif( $mpio_state_disabled > 0 ) {
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      exit( $WARN );
+   } 
+   elsif( $mpio_state_defined > 0 ) {
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown.  HINT: You should never have disks in a Defined state - they should always be Enabled.\n";
+      exit( $WARN );
+   } 
+   elsif( $mpio_state_unknown > 0 ) {
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      exit( $WARN );
+   } 
+}								#end of subroutine
+
+
+
+
+
+sub all_clear {
+   #
+   # We should only get here if there were no problems detected
+   #
+   print "running all_clear subroutine \n" if ($verbose eq "yes");
+   # Figure out if we need to send an SDD or MPIO message
+   #
+   if ( $vpath_open > 0 ) {
+      print "$CHECK_NAME OK - $vpath_count total vpath devices / $vpath_open open paths / $vpath_close closed paths / $vpath_closed_dead closed dead paths / $vpath_dead dead paths / $vpath_invalid invalid paths. \n";
+      exit( $OK );
+   }
+   #
+   if( $mpio_state_enabled > 0 ) {
+      print "$CHECK_NAME OK - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      exit( $OK );
+   } 
+   #
+   print "$CHECK_NAME Unknown - reached impossible exit point!\n";
+   exit( $UNKNOWN );
+}							#end of subroutine
+
+
+
+
+
+
+
+
+# --------------- main body of program ------------------------------------
+sanity_checks;
+check_fc_adapter_settings;
+check_blade_hardware;
+get_hdisk_info;
+check_vscsi_adapter_settings;
+check_vscsi_disk_settings;
+check_ibm_sddpcm_disk_settings;
+check_emc_disk_settings;
+check_netapp_disk_settings;
+sdd_sanity_checks;
+sdd_adapter_checks;
+sdd_vpath_checks;
+check_rootvg_disks;
+mpio_sanity_checks;
+mpio_adapter_checks;
+mpio_path_checks;
+all_clear;
+
