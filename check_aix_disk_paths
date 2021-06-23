@@ -14,27 +14,28 @@
 
 # CHANGE LOG
 # ----------
-#   2008-08-22	njeffrey@anisoftgroup.com	Script created
-#   2008-08-23	njeffrey@anisoftgroup.com	Add support for IBM AIX SDD driver (obsolete as of 2010)
-#   2008-08-24	njeffrey			Add support for IBM AIX MPIO driver 
-#   2010-08-18	njeffrey			See if blade server managed by IVM - will only have one vscsi0 path to IVM
-#   2010-12-16	njeffrey			Enhance section that checks for rootvg disk - there was a bug that missed hdisk0 disk if booting from SAN
-#   2010-12-16	njeffrey			Add check_fc_adapter_settings subroutine to check settings of fibre channel adapters
-#   2010-12-16	njeffrey			Add check_emc_disk_settings subroutine to check attributes of EMC Symmetrix disk
-#   2010-12-16	njeffrey			Add check_vscsi_disk_settings subroutine to check attributes of VIOS-provided disk
-#   2010-12-16	njeffrey			Add check_ibm_sddpcm_disk_settings subroutine to check attributes of SVC/DS8000 disk
-#   2010-12-16	njeffrey			Add check_netapp_disk_settings subroutine to check attributes of NetApp disk
-#   2010-12-18	njeffrey			Add check_rootvg_disks subroutine to check for LV-backed disk from VIO that is mirrored at the LVM layer
-#   2010-12-19	njeffrey			Add bug fixes and more error checking
-#   2010-12-21	njeffrey			Add enhanced error checks for SDD drivers
-#   2010-12-22	njeffrey			Add support for sas devices (newer hardware has /dev/sas0 instead of /dev/scsi0
-#   2011-01-07	njeffrey			Add support for LPARs running under IVM on a blade that also have their own assigned FC adapter (ie TSM server on a blade LPAR)
-#   2011-03-05	njeffrey			Bug fix - redirect prtconf stderr to stdout to avoid error checking physical volumes in volume groups that are varied off
-#   2012-07-12	njeffrey			Add check_vscsi_adapters subroutine to look for vscsi_err_recov and vscsi_fast_fail attributes
-#   2015-06-05	njeffrey			POWER 710 servers only support single VIOS - skip checks for dual VIOS on this hardware model
-#   2017-11-03	njeffrey			Bug fix - typo in redirecting STDERR to STDOUT  2>1 instead of 2>&1 
-#   2017-11-03	njeffrey			Bug fix - error in regex for adding disks to @disks_to_skip array
-#   2017-11-03	njeffrey			Add support for EMC Clariion / EMC VNX storage using EMC ODM add-on for AIX MPIO
+#   2008-08-22	njeffrey	Script created
+#   2008-08-23	njeffrey	Add support for IBM AIX SDD driver (obsolete as of 2010)
+#   2008-08-24	njeffrey	Add support for IBM AIX MPIO driver 
+#   2010-08-18	njeffrey	See if blade server managed by IVM - will only have one vscsi0 path to IVM
+#   2010-12-16	njeffrey	Enhance section that checks for rootvg disk - there was a bug that missed hdisk0 disk if booting from SAN
+#   2010-12-16	njeffrey	Add check_fc_adapter_settings subroutine to check settings of fibre channel adapters
+#   2010-12-16	njeffrey	Add check_emc_disk_settings subroutine to check attributes of EMC Symmetrix disk
+#   2010-12-16	njeffrey	Add check_vscsi_disk_settings subroutine to check attributes of VIOS-provided disk
+#   2010-12-16	njeffrey	Add check_ibm_sddpcm_disk_settings subroutine to check attributes of SVC/DS8000 disk
+#   2010-12-16	njeffrey	Add check_netapp_disk_settings subroutine to check attributes of NetApp disk
+#   2010-12-18	njeffrey	Add check_rootvg_disks subroutine to check for LV-backed disk from VIO that is mirrored at the LVM layer
+#   2010-12-19	njeffrey	Add bug fixes and more error checking
+#   2010-12-21	njeffrey	Add enhanced error checks for SDD drivers
+#   2010-12-22	njeffrey	Add support for sas devices (newer hardware has /dev/sas0 instead of /dev/scsi0
+#   2011-01-07	njeffrey	Add support for LPARs running under IVM on a blade that also have their own assigned FC adapter (ie TSM server on a blade LPAR)
+#   2011-03-05	njeffrey	Bug fix - redirect prtconf stderr to stdout to avoid error checking physical volumes in volume groups that are varied off
+#   2012-07-12	njeffrey	Add check_vscsi_adapters subroutine to look for vscsi_err_recov and vscsi_fast_fail attributes
+#   2015-06-05	njeffrey	POWER 710 servers only support single VIOS - skip checks for dual VIOS on this hardware model
+#   2017-11-03	njeffrey	Bug fix - typo in redirecting STDERR to STDOUT  2>1 instead of 2>&1 
+#   2017-11-03	njeffrey	Bug fix - error in regex for adding disks to @disks_to_skip array
+#   2017-11-03	njeffrey	Add support for EMC Clariion / EMC VNX storage using EMC ODM add-on for AIX MPIO
+#   2021-06-21	njeffrey	Add support for AIX 7.2, 7.3
 #
 #
 
@@ -459,7 +460,7 @@ sub check_blade_hardware {
          close IN;						#close filehandle
         
       } 
-      elsif ( /^7.1/ ) {					#for AIX 7.1
+      elsif ( (/^7.1/) || (/^7.2/) || (/^7.3/) ) {		#for AIX 7.x
          open(IN,"$lsrsrc IBM.MCP 2>&1 |"); 			#open filehandle using command output 
          while (<IN>) {                                		#read a line from filehandle 
             if ( /KeyToken +=/ ) {				#look for the line that tells us this is an HMC or IVM managed LPAR
