@@ -36,6 +36,8 @@
 #   2017-11-03	njeffrey	Bug fix - error in regex for adding disks to @disks_to_skip array
 #   2017-11-03	njeffrey	Add support for EMC Clariion / EMC VNX storage using EMC ODM add-on for AIX MPIO
 #   2021-06-21	njeffrey	Add support for AIX 7.2, 7.3
+#   2021-11-08  njeffrey        Regex fix in mpio_adapter_checks subroutine to skip any disks in Defined state
+#
 #
 #
 
@@ -1480,6 +1482,7 @@ sub mpio_adapter_checks {
       # any disks connected to local scsi adapters.
       next unless ( $hdisk =~ /hdisk/ );				#confirm we have a valid hdisk name 
       next if ( `$lspath -l $hdisk` =~ /Enabled +$hdisk +scsi[0-9]+/ );	#look for scsi adapters
+      next unless ( `$lsdev -l $hdisk` =~ /Available/ );                #skip any disks in a Defined/Missing/Failed state
       #
       $mpio_adapter_count = 0;						#initialize variable
       open(IN,"$lspath -l $hdisk | $uniq |");  				#open filehandle using command output
