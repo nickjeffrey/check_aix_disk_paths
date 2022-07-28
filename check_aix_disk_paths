@@ -1616,7 +1616,7 @@ sub all_clear {
    }
    #
    if( $mpio_state_enabled > 0 ) {
-      print "$CHECK_NAME OK - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      print "$CHECK_NAME OK - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown | $perf_data \n";
       exit( $OK );
    } 
    #
