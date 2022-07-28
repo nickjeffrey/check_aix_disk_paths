@@ -37,6 +37,7 @@
 #   2017-11-03	njeffrey	Add support for EMC Clariion / EMC VNX storage using EMC ODM add-on for AIX MPIO
 #   2021-06-21	njeffrey	Add support for AIX 7.2, 7.3
 #   2021-11-08  njeffrey        Regex fix in mpio_adapter_checks subroutine to skip any disks in Defined state
+#   2022-07-28  njeffrey        Add perf_data output
 #
 #
 #
@@ -167,6 +168,7 @@ my $lv_lps              = "";			#number of logical partitions in logical volume
 my $lv_pps              = "";			#number of physical partitions in logical volume
 my $lv_pvs              = "";			#number of physical volumes in logical volume
 my ($CHECK_NAME,$OK,$WARN,$CRITICAL,$UNKNOWN,$hdisk,@hdisks,@hdisks_to_skip,%hdisks_to_skip,%hdisks);
+my ($perf_data);
 
 
 
@@ -1561,30 +1563,38 @@ sub mpio_path_checks {
    }								#end of while loop
    close IN;							#close filehandle
    #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   $perf_data = "enabled=${enabled};;;; missing=${missing};;;; failed=${failed};;;; disabled=${disabled};;;; defined=${defined};;;; unknown=${unknown};;;;";
+   #
+   #
    # generate alerts if necessary for MPIO path problems
    #
    if (($mpio_state_enabled==0) && ($mpio_state_missing==0) && ($mpio_state_failed==0) && ($mpio_state_disabled== 0)){
-      print "$CHECK_NAME OK - nothing to do.  No MPIO or SDD disks exist on this system.\n";
+      print "$CHECK_NAME OK - nothing to do.  No MPIO or SDD disks exist on this system.  | $perf_data \n";
       exit( $OK );
    }  
    elsif ( $mpio_state_failed > 0 ) {
-      print "$CHECK_NAME CRITICAL - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown. \n";
+      print "$CHECK_NAME CRITICAL - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown.  | $perf_data \n";
       exit( $CRITICAL );
    }  
    elsif( $mpio_state_missing > 0 ) {
-      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown  | $perf_data \n";
       exit( $WARN );
    } 
    elsif( $mpio_state_disabled > 0 ) {
-      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown  | $perf_data \n";
       exit( $WARN );
    } 
    elsif( $mpio_state_defined > 0 ) {
-      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown.  HINT: You should never have disks in a Defined state - they should always be Enabled.\n";
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown.  HINT: You should never have disks in a Defined state - they should always be Enabled.  | $perf_data\n";
       exit( $WARN );
    } 
    elsif( $mpio_state_unknown > 0 ) {
-      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown\n";
+      print "$CHECK_NAME WARN - $mpio_state_enabled enabled / $mpio_state_failed failed / $mpio_state_missing missing / $mpio_state_disabled disabled / $mpio_state_defined defined / $mpio_state_unknown unknown  | $perf_data\n";
       exit( $WARN );
    } 
 }								#end of subroutine
@@ -1601,7 +1611,7 @@ sub all_clear {
    # Figure out if we need to send an SDD or MPIO message
    #
    if ( $vpath_open > 0 ) {
-      print "$CHECK_NAME OK - $vpath_count total vpath devices / $vpath_open open paths / $vpath_close closed paths / $vpath_closed_dead closed dead paths / $vpath_dead dead paths / $vpath_invalid invalid paths. \n";
+      print "$CHECK_NAME OK - $vpath_count total vpath devices / $vpath_open open paths / $vpath_close closed paths / $vpath_closed_dead closed dead paths / $vpath_dead dead paths / $vpath_invalid invalid paths. | $perf_data \n";
       exit( $OK );
    }
    #
