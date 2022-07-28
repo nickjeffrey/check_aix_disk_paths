@@ -1568,7 +1568,7 @@ sub mpio_path_checks {
    # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
    # You can have multiple items of perf data, just separate each section with a space
    # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
-   $perf_data = "enabled=${mpio_state_enabled};;;; missing=${mpio_state_missing};;;; failed=${mpio_state_failed};;;; disabled=${mpio_state_disabled};;;; defined=${mpio_state_defined};;;; unknown=${unknown};;;;";
+   $perf_data = "enabled=${mpio_state_enabled};;;; missing=${mpio_state_missing};;;; failed=${mpio_state_failed};;;; disabled=${mpio_state_disabled};;;; defined=${mpio_state_defined};;;; unknown=${mpio_state_unknown};;;;";
    #
    #
    # generate alerts if necessary for MPIO path problems
