@@ -42,3 +42,10 @@ If you are using the NRPE method, you will also need a command definition simila
 ```
     command[check_aix_disk_paths]=/usr/local/nagios/libexec/check_aix_disk_paths
 ```
+
+
+# Sample Output
+
+```
+AIX_DISK_PATHS OK - 200 enabled / 0 failed / 0 missing / 0 disabled / 0 defined / 0 unknown | enabled=200;;;; missing=0;;;; failed=0;;;; disabled=0;;;; defined=0;;;; unknown=0;;;;
+```
