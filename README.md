@@ -6,7 +6,7 @@ This script will validate the following features for disks using MPIO as the mul
     - each hdisk has paths to at least 2 vscsi or fscsi adapters
     - each hdisk has at least 2 paths
     - no paths are in one of the following states: Disabled, Failed, Unknown, Defined
-    - all paths are in the "Enabled" state (which is kinda assumed by the previous line)
+    - all paths are in the "Enabled" state (which is assumed by the previous line)
 ```
 
 # Requirements
